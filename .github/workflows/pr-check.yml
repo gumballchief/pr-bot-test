@@ -1,72 +1,21 @@
-// Live bot: reads the SELF-BUILT brain from .github/brain.json
-import { readFileSync } from "node:fs";
-
-const ANTHROPIC = process.env.ANTHROPIC_API_KEY;
-const TOKEN = process.env.GITHUB_TOKEN;
-const [OWNER, REPO] = (process.env.REPO || "").split("/");
-const PR = process.env.PR_NUMBER;
-
-// Load the brain that was built from real repo history.
-let brain = [];
-try {
-  brain = JSON.parse(readFileSync(".github/brain.json", "utf8")).decisions || [];
-} catch (_) {
-  console.error("No brain.json found — exiting quietly.");
-  process.exit(0);
-}
-console.log(`Loaded ${brain.length} decisions from brain.json`);
-
-async function gh(method, path, body) {
-  const res = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}${path}`, {
-    method,
-    headers: { authorization: `Bearer ${TOKEN}`, accept: "application/vnd.github+json", "user-agent": "pr-bot", "content-type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) { console.error(`GitHub ${res.status}: ${await res.text()}`); process.exit(1); }
-  return res.json();
-}
-
-async function check(pr) {
-  const brainText = brain.map((d) => `- ${d.decision} | covers: ${(d.examples||[]).join(", ")} | evidence: ${d.evidence}`).join("\n");
-  const prompt = `You review PRs for ONE team. Their decisions, learned from past PRs:
-${brainText}
-
-NEW pull request:
-TITLE: ${pr.title}
-DESCRIPTION: ${pr.body || ""}
-
-Step 1: what category of change is this?
-Step 2: does it clearly conflict with a decision above (check "covers")?
-Only warn on a CLEAR conflict.
-Respond ONLY with JSON: {"warn":true/false,"evidence":"...","explanation":"one sentence","confidence":"high/medium/low"}`;
-  for (let i = 1; i <= 2; i++) {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": ANTHROPIC, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 400, messages: [{ role: "user", content: prompt }] }),
-    });
-    const data = await res.json();
-    if (!data.content) { console.error(`Anthropic empty (try ${i})`); continue; }
-    try { return JSON.parse(data.content.map((c) => c.text || "").join("").replace(/```json|```/g, "").trim()); } catch (_) {}
-  }
-  return null;
-}
-
-const pr = await gh("GET", `/pulls/${PR}`);
-console.log(`Checking PR #${PR}: ${pr.title}`);
-const r = await check(pr);
-if (!r) { console.error("AI failed twice; exiting quietly."); process.exit(0); }
-console.log(`warn=${r.warn} confidence=${r.confidence}`);
-
-if (r.warn && r.confidence === "high") {
-  const comment = `👋 **Heads up before review** — this looks like it may conflict with a past team decision.
-
-**Likely issue:** ${r.explanation}
-**Based on:** ${r.evidence}
-
-If this is intentional or things have changed, just say so here. _(Automated pre-check.)_`;
-  await gh("POST", `/issues/${PR}/comments`, { body: comment });
-  console.log("Posted comment.");
-} else {
-  console.log("Stayed silent.");
-}
+name: PR Decision Check
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  pull-requests: write
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: node .github/scripts/pr-check.mjs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
